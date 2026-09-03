@@ -319,7 +319,7 @@ public class VigilanceDao implements TablesDao, Serializable {
         sql.append("ORDER BY rankTier, `name`");
 
         Query query = em.createNativeQuery(sql.toString());
-        query.setParameter(1, parseParameters(keyword));
+        query.setParameter(1, parseSearchParameters(keyword));
         query.setParameter(2, firstSearchWord(keyword));
         query.setParameter(3, Category.AI_GENERIC.getOrdinal());
         query.setParameter(4, Category.BRAND.getOrdinal());
@@ -818,6 +818,88 @@ public class VigilanceDao implements TablesDao, Serializable {
             }
         }
         return keyword.trim().replaceAll("[^\\p{L}\\p{N}]", "");
+    }
+
+    /**
+     * Splits a user's search term into FULLTEXT boolean-mode operands, requiring every word.
+     * <p>
+     * {@link #parseParameters} splits on commas only, so "apo atorvastatin" became the single
+     * operand "+apo atorvastatin*", which asks for "apo" and merely prefers "atorvastatin":
+     * every product from that manufacturer came back. Splitting on whitespace as well makes
+     * both words required.
+     * <p>
+     * Every character that is not a letter or digit separates words, rather than a chosen list
+     * of separators. FULLTEXT indexes punctuation as a word separator anyway, so this matches
+     * how the data is stored: "INSULIN-ASPART-RAPID" is three indexed words. It also means a
+     * stray operator character cannot reach the query, where it would either be read as an
+     * operator ("pms-amoxicillin" as "pms AND NOT amoxicillin") or fail outright ("apo-"
+     * becoming the invalid "+apo-*").
+     * <p>
+     * Words below {@link #MINIMUM_TOKEN_LENGTH} are dropped because the index does not hold
+     * them, and requiring one with a wildcard matches far too much: "children's" split into
+     * "children" and "s" would ask for a word beginning with "s" as well.
+     * <p>
+     * A term carrying boolean operators the caller wrote themselves is handed to
+     * {@link #parseParameters} unchanged, so the quoted-phrase, +/- and OR forms keep working.
+     * <p>
+     * This is deliberately separate from {@link #parseParameters}, which is shared with
+     * {@link #listSearchAll} on the allergy-checking path. Requiring every word there could
+     * narrow an allergy description enough to drop a warning, so that parsing is left alone.
+     *
+     * @param keyword String the search term as typed by the user
+     * @return String the boolean-mode expression to match against
+     */
+    private String parseSearchParameters(String keyword) {
+        if (hasExplicitBooleanSyntax(keyword)) {
+            return parseParameters(keyword);
+        }
+
+        StringBuilder parameterBuilder = new StringBuilder();
+        for (String word : keyword.toLowerCase().split("[^\\p{L}\\p{N}]+")) {
+            if (word.length() >= MINIMUM_TOKEN_LENGTH) {
+                addOperators(word, parameterBuilder);
+            }
+        }
+
+        if (parameterBuilder.length() == 0) {
+            // Every word was below the index's minimum length, as in "b-12". Retry with the
+            // punctuation removed rather than searching for nothing, so "b-12" finds "B12".
+            String collapsed = keyword.toLowerCase().replaceAll("[^\\p{L}\\p{N}]", "");
+            if (!collapsed.isEmpty()) {
+                addOperators(collapsed, parameterBuilder);
+            }
+        }
+
+        return parameterBuilder.toString().trim();
+    }
+
+    /**
+     * True when the search term carries boolean operators the caller wrote, whose grouping has
+     * to be preserved rather than split into separate required words. A hyphen only counts at
+     * the start of a word: mid-word hyphens are part of drug names such as "pms-amoxicillin".
+     *
+     * @param keyword String the search term as typed by the user
+     * @return boolean true when the term should be passed through unsplit
+     */
+    private boolean hasExplicitBooleanSyntax(String keyword) {
+        // Operators need something to operate on, and an odd number of quotes is an unfinished
+        // phrase rather than a deliberate one. Either way the term is not usable boolean syntax,
+        // so it is treated as plain text instead of being passed through to fail in the query.
+        // No lambda here on purpose: the OpenJPA enhancer this project runs cannot read the
+        // invokedynamic instruction one compiles to, and fails the build on this class.
+        int quoteCount = keyword.length() - keyword.replace("\"", "").length();
+        if (!keyword.matches(".*[\\p{L}\\p{N}].*") || quoteCount % 2 != 0) {
+            return false;
+        }
+        if (keyword.indexOf('"') >= 0) {
+            return true;
+        }
+        for (String word : keyword.trim().split("\\s+")) {
+            if (word.startsWith("+") || word.startsWith("-") || "OR".equals(word)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String parseParameters(String keyword) {

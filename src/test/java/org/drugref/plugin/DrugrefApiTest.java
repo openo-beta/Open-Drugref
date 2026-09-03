@@ -327,9 +327,103 @@ public class DrugrefApiTest extends TestCase {
         }
     }
 
+    /**
+     * Every word the user types has to be required. The search term is split into words on any
+     * character that is not a letter or digit, matching how FULLTEXT indexes the data, so
+     * "apo atorvastatin" asks for both words. Splitting on commas alone made it one operand,
+     * "+apo atorvastatin*", which requires "apo" and merely prefers "atorvastatin": that
+     * returned every product from the manufacturer, 961 rows for this term.
+     */
+    public void testSearchRequiresEveryWord() {
+        Drugref drugref = new Drugref(VigilanceDao.class);
 
+        Vector both = drugref.list_search_element3("apo atorvastatin");
+        Assert.assertFalse("search returned nothing, the fixture data is missing", both.isEmpty());
 
+        Vector manufacturerOnly = drugref.list_search_element3("apo");
+        Assert.assertTrue("requiring both words must return fewer rows than the manufacturer alone",
+                both.size() < manufacturerOnly.size());
 
+        for (Object row : both) {
+            String name = String.valueOf(((Hashtable) row).get("name")).toLowerCase();
+            Assert.assertTrue("row matches only one of the words: " + name,
+                    name.contains("apo") && name.contains("atorvastatin"));
+        }
+    }
 
+    /**
+     * A hyphen is a word separator, not the boolean NOT operator. FULLTEXT stores
+     * "INSULIN-ASPART-RAPID" as three words, so a hyphenated term has to be searched as
+     * separate words. Left whole, "pms-amoxicillin" reads as "pms AND NOT amoxicillin".
+     */
+    public void testSearchTreatsHyphenAsSeparator() {
+        Drugref drugref = new Drugref(VigilanceDao.class);
+
+        Vector hyphenated = drugref.list_search_element3("pms-amoxicillin");
+        Assert.assertFalse("hyphenated search returned nothing", hyphenated.isEmpty());
+        Assert.assertEquals("a hyphen and a space must mean the same thing",
+                drugref.list_search_element3("pms amoxicillin").size(), hyphenated.size());
+
+        for (Object row : hyphenated) {
+            String name = String.valueOf(((Hashtable) row).get("name")).toLowerCase();
+            Assert.assertTrue("hyphen was read as an exclusion: " + name, name.contains("amoxicillin"));
+        }
+    }
+
+    /**
+     * The typeahead searches on every keystroke, so half-typed terms reach this code. None of
+     * them may raise: a failure here reaches the browser as an unparseable response and the
+     * dropdown silently stops appearing. "apo-" is the case reported from the interface.
+     */
+    public void testSearchAcceptsAnyPunctuation() {
+        Drugref drugref = new Drugref(VigilanceDao.class);
+
+        String[] terms = {"apo-", "amoxicillin /", "acetaminophen (extra strength)", "children's",
+                          "tylenol #3", "hydrocortisone 1%", "insulin 70/30", "b-12",
+                          "-", "+", "*", "\"", "%", "(", "~", ">", "<", "@", "\"ab", "   ", ""};
+        for (String term : terms) {
+            try {
+                Assert.assertNotNull("null result for: " + term, drugref.list_search_element3(term));
+            } catch (Exception e) {
+                Assert.fail("search raised on '" + term + "': " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Words the caller wrote boolean operators into are passed through with their grouping
+     * intact, so the quoted-phrase, +/- and OR forms this search supports keep working.
+     */
+    public void testSearchPreservesExplicitBooleanSyntax() {
+        Drugref drugref = new Drugref(VigilanceDao.class);
+
+        Assert.assertFalse("quoted phrase returned nothing",
+                drugref.list_search_element3("\"amoxicillin*\"").isEmpty());
+
+        Vector excluded = drugref.list_search_element3("+amoxicillin -apo");
+        Assert.assertFalse("excluding a manufacturer returned nothing", excluded.isEmpty());
+        for (Object row : excluded) {
+            String name = String.valueOf(((Hashtable) row).get("name")).toLowerCase();
+            Assert.assertFalse("the -apo exclusion was not honoured: " + name, name.contains("apo "));
+        }
+    }
+
+    /**
+     * Words below the index's minimum token size are dropped rather than required. The index
+     * does not hold them, so requiring one asks for something that cannot match and empties the
+     * result: "insulin 70" would return nothing while the user is still typing toward
+     * "insulin 70/30". Dropping them matches what the search did before, where a trailing short
+     * word was optional and narrowed nothing either.
+     */
+    public void testSearchIgnoresFragmentsTooShortToBeIndexed() {
+        Drugref drugref = new Drugref(VigilanceDao.class);
+
+        int insulin = drugref.list_search_element3("insulin").size();
+        Assert.assertTrue("search returned nothing, the fixture data is missing", insulin > 0);
+        Assert.assertEquals("a fragment too short to be indexed must not narrow the search",
+                insulin, drugref.list_search_element3("insulin 70").size());
+        Assert.assertEquals("nor may it empty the search",
+                insulin, drugref.list_search_element3("insulin 70/30").size());
+    }
 
 }

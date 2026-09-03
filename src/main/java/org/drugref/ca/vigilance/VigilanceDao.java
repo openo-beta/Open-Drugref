@@ -25,6 +25,11 @@ public class VigilanceDao implements TablesDao, Serializable {
      * Future development should consider the system language French or English
      */
     private static String language = "English";
+
+    /**
+     * Shortest word the FULLTEXT index holds, from the server's innodb_ft_min_token_size.
+     */
+    private static final int MINIMUM_TOKEN_LENGTH = 3;
     private String name;
     private String version;
 
@@ -237,52 +242,100 @@ public class VigilanceDao implements TablesDao, Serializable {
      */
     @Override
     public Vector listSearchElement4(String keyword, boolean ingredientOnly){
-        if(ingredientOnly) {
-            return listSearchIngredient(keyword);
-        } else {
-            return listSearchAll(keyword);
-        }
+        return listSearchBrandAndGeneric(keyword);
     }
 
     /**
-     * All search results are returned as a list of drug ingredients.
-     * Example: searching for a brand name will return only the ingredients
-     * for the brand name.
-     * @return
+     * Searches the brand and generic product tables, and nothing else.
+     * <p>
+     * The ingredient table is deliberately not searched. Its rows describe active
+     * ingredients rather than products, so they carry no product identifier and cannot be
+     * turned into a prescription by the caller.
+     * <p>
+     * Rows that would display an identical label are collapsed here rather than by the
+     * caller, so that the surviving row is chosen deliberately. The generic record is
+     * preferred over the brand record for a shared label. Results are ordered so that an
+     * exact match on the search term comes before combination products, which in turn come
+     * before manufacturer-branded variants.
+     *
+     * @param keyword String the search term as typed by the user
+     * @return Vector of Hashtable rows carrying id, category, drugCode and name
      */
-    private Vector listSearchIngredient(String keyword) {
-
+    private Vector listSearchBrandAndGeneric(String keyword) {
         EntityManager em = JpaUtils.createEntityManager();
         Assert.notNull(keyword, "Search value cannot be null.");
 
-        StringBuilder sql = new StringBuilder();
-        sql.append("SELECT ");
-        sql.append("uuid AS `id`,");
-        sql.append("CAST(?2 AS NCHAR) AS category,");
-        sql.append("GENcode AS `drugCode`,CONCAT(genericNameEnglish, ' ', IFNULL(strengthEnglish,''), ' ', IFNULL(formEnglish,'')) AS `name`,");
-        sql.append("genericNameEnglish,");
-        sql.append("strengthEnglish ");
-        sql.append("FROM vig_generxPlus ");
-        sql.append("WHERE GENcode IN (");
-        sql.append("SELECT GENcode ");
-        sql.append("FROM (");
-        sql.append("SELECT GENcode ");
-        sql.append("FROM vig_nomprodPlus ");
-        sql.append("WHERE MATCH(productNameEnglish, strengthEnglish, formEnglish) against (?1 IN BOOLEAN MODE)");
-        sql.append(" UNION ");
-        sql.append("SELECT GENcode ");
-        sql.append("FROM vig_generxPlus ");
-        sql.append("WHERE MATCH(lowercaseGenericNameEnglish, strengthEnglish, formEnglish) AGAINST (?1 IN BOOLEAN MODE)");
-        sql.append(") gencodes ");
-        sql.append("GROUP BY gencodes.GENcode having count(gencodes.GENcode) > -1 ");
-        sql.append(") ORDER BY genericNameEnglish, strengthEnglish;");
+        // Column names carry the language as a suffix. They are resolved once here so that an
+        // identifier is never split across two append calls in the middle of the statement.
+        String genericName = "genericName" + language;
+        String lowercaseGenericName = "lowercaseGenericName" + language;
+        String productName = "productName" + language;
+        String productNameCapitalized = "productNameCapitalized" + language;
+        String strength = "strength" + language;
+        String form = "form" + language;
 
-        Query query = em.createNativeQuery(sql.toString(), Hashtable.class);
-        String parameters = parseParameters(keyword);
-        query.setParameter(1, parameters);
-        query.setParameter(2, Category.AI_GENERIC.getOrdinal());
-        List results = query.getResultList();
-        Vector<Hashtable<String, Object>> resultList = new Vector<Hashtable<String,Object>>(results);
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT `id`, `category`, `drugCode`, `name` FROM (");
+        sql.append("SELECT `id`, `category`, `drugCode`, `name`, rankTier, ");
+        sql.append("ROW_NUMBER() OVER (PARTITION BY `name` ORDER BY preferred, `id`) AS rowNumber ");
+        sql.append("FROM (");
+
+        // Generic products. Preferred over the brand record when both carry the same label.
+        sql.append("SELECT uuid AS `id`, ");
+        sql.append("CAST(?3 AS NCHAR) AS `category`, ");
+        sql.append("GENcode AS `drugCode`, ");
+        sql.append("CONCAT(").append(genericName).append(", ' ', ");
+        sql.append("IFNULL(").append(strength).append(",''), ' ', ");
+        sql.append("IFNULL(").append(form).append(",'')) AS `name`, ");
+        sql.append("0 AS preferred, ");
+        sql.append("CASE WHEN ").append(genericName).append(" = ?2 THEN 0 ");
+        sql.append("WHEN ").append(genericName).append(" LIKE CONCAT(?2,'%') THEN 1 ");
+        sql.append("ELSE 2 END AS rankTier ");
+        sql.append("FROM vig_generxPlus ");
+        sql.append("WHERE MATCH(").append(lowercaseGenericName).append(", ");
+        sql.append(strength).append(", ").append(form).append(") ");
+        sql.append("AGAINST (?1 IN BOOLEAN MODE)");
+
+        sql.append(" UNION ALL ");
+
+        // Brand products.
+        sql.append("SELECT productID AS `id`, ");
+        sql.append("CAST(?4 AS NCHAR) AS `category`, ");
+        sql.append("GENcode AS `drugCode`, ");
+        sql.append("CONCAT(").append(productNameCapitalized).append(", ' ', ");
+        sql.append("IFNULL(").append(strength).append(",''), ' ', ");
+        sql.append("IFNULL(").append(form).append(",'')) AS `name`, ");
+        sql.append("1 AS preferred, ");
+        sql.append("CASE WHEN ").append(productNameCapitalized).append(" = ?2 THEN 0 ");
+        sql.append("WHEN ").append(productNameCapitalized).append(" LIKE CONCAT(?2,'%') THEN 1 ");
+        sql.append("ELSE 2 END AS rankTier ");
+        sql.append("FROM vig_nomprodPlus ");
+        sql.append("WHERE MATCH(").append(productName).append(", ");
+        sql.append(strength).append(", ").append(form).append(") ");
+        sql.append("AGAINST (?1 IN BOOLEAN MODE)");
+
+        sql.append(") u");
+        sql.append(") d WHERE rowNumber = 1 ");
+        sql.append("ORDER BY rankTier, `name`");
+
+        Query query = em.createNativeQuery(sql.toString());
+        query.setParameter(1, parseParameters(keyword));
+        query.setParameter(2, firstSearchWord(keyword));
+        query.setParameter(3, Category.AI_GENERIC.getOrdinal());
+        query.setParameter(4, Category.BRAND.getOrdinal());
+
+        List<Object[]> results = query.getResultList();
+        Vector<Hashtable<String, Object>> resultList = new Vector<>();
+
+        for (Object[] row : results) {
+            Hashtable<String, Object> ha = new Hashtable<>();
+            ha.put("id", row[0]);
+            ha.put("category", row[1]);
+            ha.put("drugCode", row[2]);
+            ha.put("name", row[3]);
+            resultList.add(ha);
+        }
+
         JpaUtils.close(em);
         return resultList;
     }
@@ -745,6 +798,28 @@ public class VigilanceDao implements TablesDao, Serializable {
      * ie
      * tylenol, 500, tablet
      */
+    /**
+     * The first word of the search term, used to rank results by how well they match what was
+     * typed.
+     * <p>
+     * This has to be the first word rather than the whole term, because the ranking compares it
+     * against a product name with "=" and "LIKE ...%": "amoxicillin 500" matches no name either
+     * way, which would drop every row into the same tier and leave the results in name order.
+     * Ranking on "amoxicillin" keeps the plain strengths above the branded variants.
+     *
+     * @param keyword String the search term as typed by the user
+     * @return String the first word long enough to be indexed, or the term with its punctuation
+     *         removed when it has no such word
+     */
+    private String firstSearchWord(String keyword) {
+        for (String word : keyword.trim().split("[^\\p{L}\\p{N}]+")) {
+            if (word.length() >= MINIMUM_TOKEN_LENGTH) {
+                return word;
+            }
+        }
+        return keyword.trim().replaceAll("[^\\p{L}\\p{N}]", "");
+    }
+
     private String parseParameters(String keyword) {
         StringTokenizer stringTokenizer = new StringTokenizer(keyword, ",", false);
         StringBuilder parameterBuilder = new StringBuilder();

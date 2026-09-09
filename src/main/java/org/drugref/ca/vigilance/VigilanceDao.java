@@ -16,6 +16,8 @@ import javax.persistence.EntityManager;
 import javax.persistence.Query;
 import java.io.Serializable;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Repository
 public class VigilanceDao implements TablesDao, Serializable {
@@ -30,6 +32,12 @@ public class VigilanceDao implements TablesDao, Serializable {
      * Shortest word the FULLTEXT index holds, from the server's innodb_ft_min_token_size.
      */
     private static final int MINIMUM_TOKEN_LENGTH = 3;
+
+    /**
+     * One search token: a quoted phrase with its optional sign, or a run of non-space
+     * characters. The phrase alternative comes first so that the quotes are kept together.
+     */
+    private static final Pattern SEARCH_TOKEN = Pattern.compile("[+-]?\"[^\"]*\"|\\S+");
     private String name;
     private String version;
 
@@ -839,8 +847,16 @@ public class VigilanceDao implements TablesDao, Serializable {
      * them, and requiring one with a wildcard matches far too much: "children's" split into
      * "children" and "s" would ask for a word beginning with "s" as well.
      * <p>
-     * A term carrying boolean operators the caller wrote themselves is handed to
-     * {@link #parseParameters} unchanged, so the quoted-phrase, +/- and OR forms keep working.
+     * Operators the caller wrote are honoured per token rather than diverting the whole term:
+     * a leading "+" or "-" applies to every word in that token, and a quoted phrase is passed
+     * whole. Handing the term to {@link #parseParameters} instead, as this method first did,
+     * meant an operator anywhere disabled the word split for everything else, so
+     * "amoxicillin 500 -penta" returned the same rows as "amoxicillin -penta". It was also
+     * positionally unstable, because {@link #addOperators} appends its wildcard once at the
+     * end: adding a trailing token silently un-wildcarded the one before it.
+     * <p>
+     * "OR" is not carved out, because MySQL boolean mode has no such operator. It was only
+     * ever an optional word, so "apo OR pms" returned exactly the rows holding "apo".
      * <p>
      * This is deliberately separate from {@link #parseParameters}, which is shared with
      * {@link #listSearchAll} on the allergy-checking path. Requiring every word there could
@@ -850,14 +866,30 @@ public class VigilanceDao implements TablesDao, Serializable {
      * @return String the boolean-mode expression to match against
      */
     private String parseSearchParameters(String keyword) {
-        if (hasExplicitBooleanSyntax(keyword)) {
-            return parseParameters(keyword);
-        }
-
         StringBuilder parameterBuilder = new StringBuilder();
-        for (String word : keyword.toLowerCase().split("[^\\p{L}\\p{N}]+")) {
-            if (word.length() >= MINIMUM_TOKEN_LENGTH) {
-                addOperators(word, parameterBuilder);
+        Matcher tokens = SEARCH_TOKEN.matcher(keyword.toLowerCase());
+
+        while (tokens.find()) {
+            String token = tokens.group();
+            String sign = "+";
+            if (token.startsWith("-")) {
+                sign = "-";
+                token = token.substring(1);
+            } else if (token.startsWith("+")) {
+                token = token.substring(1);
+            }
+
+            if (isQuotedPhrase(token)) {
+                // A phrase goes to the query whole: it matches adjacent words, and neither the
+                // word minimum nor a wildcard applies inside quotes.
+                parameterBuilder.append(sign).append(token).append(" ");
+                continue;
+            }
+
+            for (String word : token.split("[^\\p{L}\\p{N}]+")) {
+                if (word.length() >= MINIMUM_TOKEN_LENGTH) {
+                    parameterBuilder.append(sign).append(word).append("*").append(" ");
+                }
             }
         }
 
@@ -866,7 +898,7 @@ public class VigilanceDao implements TablesDao, Serializable {
             // punctuation removed rather than searching for nothing, so "b-12" finds "B12".
             String collapsed = keyword.toLowerCase().replaceAll("[^\\p{L}\\p{N}]", "");
             if (!collapsed.isEmpty()) {
-                addOperators(collapsed, parameterBuilder);
+                parameterBuilder.append("+").append(collapsed).append("*");
             }
         }
 
@@ -874,33 +906,19 @@ public class VigilanceDao implements TablesDao, Serializable {
     }
 
     /**
-     * True when the search term carries boolean operators the caller wrote, whose grouping has
-     * to be preserved rather than split into separate required words. A hyphen only counts at
-     * the start of a word: mid-word hyphens are part of drug names such as "pms-amoxicillin".
+     * True for a token that is a complete quoted phrase with something in it. An unbalanced
+     * quote is not one, and is left to the word split, which discards the stray character.
      *
-     * @param keyword String the search term as typed by the user
-     * @return boolean true when the term should be passed through unsplit
+     * @param token String one whitespace-delimited token, any leading sign already removed
+     * @return boolean true when the token should be passed to the query as a phrase
      */
-    private boolean hasExplicitBooleanSyntax(String keyword) {
-        // Operators need something to operate on, and an odd number of quotes is an unfinished
-        // phrase rather than a deliberate one. Either way the term is not usable boolean syntax,
-        // so it is treated as plain text instead of being passed through to fail in the query.
-        // No lambda here on purpose: the OpenJPA enhancer this project runs cannot read the
-        // invokedynamic instruction one compiles to, and fails the build on this class.
-        int quoteCount = keyword.length() - keyword.replace("\"", "").length();
-        if (!keyword.matches(".*[\\p{L}\\p{N}].*") || quoteCount % 2 != 0) {
-            return false;
-        }
-        if (keyword.indexOf('"') >= 0) {
-            return true;
-        }
-        for (String word : keyword.trim().split("\\s+")) {
-            if (word.startsWith("+") || word.startsWith("-") || "OR".equals(word)) {
-                return true;
-            }
-        }
-        return false;
+    private boolean isQuotedPhrase(String token) {
+        return token.length() > 2
+                && token.startsWith("\"")
+                && token.endsWith("\"")
+                && token.substring(1, token.length() - 1).matches(".*[\\p{L}\\p{N}].*");
     }
+
 
     private String parseParameters(String keyword) {
         StringTokenizer stringTokenizer = new StringTokenizer(keyword, ",", false);

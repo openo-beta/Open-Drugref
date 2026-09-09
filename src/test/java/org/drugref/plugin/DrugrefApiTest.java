@@ -391,8 +391,9 @@ public class DrugrefApiTest extends TestCase {
     }
 
     /**
-     * Words the caller wrote boolean operators into are passed through with their grouping
-     * intact, so the quoted-phrase, +/- and OR forms this search supports keep working.
+     * Operators the caller wrote are honoured, a quoted phrase as a phrase and a leading "-" as
+     * an exclusion. They are applied per word rather than diverting the whole term, so they also
+     * compose with plain words: see the two tests below.
      */
     public void testSearchPreservesExplicitBooleanSyntax() {
         Drugref drugref = new Drugref(VigilanceDao.class);
@@ -409,11 +410,13 @@ public class DrugrefApiTest extends TestCase {
     }
 
     /**
-     * Words below the index's minimum token size are dropped rather than required. The index
-     * does not hold them, so requiring one asks for something that cannot match and empties the
-     * result: "insulin 70" would return nothing while the user is still typing toward
-     * "insulin 70/30". Dropping them matches what the search did before, where a trailing short
-     * word was optional and narrowed nothing either.
+     * Words below the index's minimum token size are dropped rather than required. Not because
+     * they cannot match: a short wildcard does match, "+70*" finds 320 rows on its own. Because
+     * a one or two character prefix matches the wrong things, and is usually a fragment of a
+     * word rather than a word. Requiring the "s" from "children's" cuts that search from 333
+     * rows to 72. Dropping every short fragment is uniform and predictable, which a rule based
+     * on where the fragment came from would not be: "insulin 70" and "tylenol #3" are the same
+     * shape, and keeping the fragment helps the first and hurts the second.
      */
     public void testSearchIgnoresFragmentsTooShortToBeIndexed() {
         Drugref drugref = new Drugref(VigilanceDao.class);
@@ -424,6 +427,73 @@ public class DrugrefApiTest extends TestCase {
                 insulin, drugref.list_search_element3("insulin 70").size());
         Assert.assertEquals("nor may it empty the search",
                 insulin, drugref.list_search_element3("insulin 70/30").size());
+    }
+
+    /**
+     * An operator no longer disables the word split for the rest of the term. Before, any "+",
+     * "-" or quote handed the whole term to the legacy parser, so "amoxicillin 500 -penta"
+     * returned exactly the rows of "amoxicillin -penta" and the strength was ignored.
+     */
+    public void testSearchCombinesOperatorsWithWords() {
+        Drugref drugref = new Drugref(VigilanceDao.class);
+
+        Vector exclusionOnly = drugref.list_search_element3("amoxicillin -penta");
+        Assert.assertFalse("search returned nothing, the fixture data is missing",
+                exclusionOnly.isEmpty());
+
+        Vector withStrength = drugref.list_search_element3("amoxicillin 500 -penta");
+        Assert.assertFalse("combining a strength with an exclusion returned nothing",
+                withStrength.isEmpty());
+        Assert.assertTrue("the strength must narrow the search, not be ignored alongside the exclusion",
+                withStrength.size() < exclusionOnly.size());
+
+        for (Object row : withStrength) {
+            String name = String.valueOf(((Hashtable) row).get("name")).toLowerCase();
+            Assert.assertTrue("row does not carry the strength that was asked for: " + name,
+                    name.contains("500"));
+            Assert.assertFalse("the exclusion was not honoured: " + name, name.contains("penta"));
+        }
+    }
+
+    /**
+     * A quoted phrase composes with the words beside it. Before, the quote alone diverted the
+     * term, so the trailing word was optional and could not narrow anything.
+     */
+    public void testSearchCombinesQuotedPhraseWithWords() {
+        Drugref drugref = new Drugref(VigilanceDao.class);
+
+        Vector phrase = drugref.list_search_element3("\"amlodipine atorvastatin\"");
+        Assert.assertFalse("the phrase alone returned nothing, the fixture data is missing",
+                phrase.isEmpty());
+
+        Vector phraseAndWord = drugref.list_search_element3("\"amlodipine atorvastatin\" 500");
+        Assert.assertTrue("a word beside a phrase must narrow the search",
+                phraseAndWord.size() < phrase.size());
+
+        for (Object row : phraseAndWord) {
+            String name = String.valueOf(((Hashtable) row).get("name")).toLowerCase();
+            Assert.assertTrue("row does not carry the word asked for beside the phrase: " + name,
+                    name.contains("500"));
+        }
+    }
+
+    /**
+     * Every word carries its own wildcard, so a word's meaning does not depend on its position.
+     * The legacy parser appended one wildcard to the end of the whole term, so adding a trailing
+     * token silently un-wildcarded the one before it: "+amoxicillin +500" matched the 500MG
+     * products, while "+amoxicillin +500 -penta" required an exact "500" token and returned three
+     * unrelated combination products instead. Excluding a word that appears nowhere must
+     * therefore change nothing at all.
+     */
+    public void testSearchWildcardsEveryWordNotOnlyTheLast() {
+        Drugref drugref = new Drugref(VigilanceDao.class);
+
+        Vector plain = drugref.list_search_element3("amoxicillin 500");
+        Assert.assertFalse("search returned nothing, the fixture data is missing", plain.isEmpty());
+
+        Vector withInertExclusion = drugref.list_search_element3("amoxicillin 500 -zzzzzz");
+        Assert.assertEquals("excluding a word that appears nowhere must not change the result",
+                plain.size(), withInertExclusion.size());
     }
 
 }

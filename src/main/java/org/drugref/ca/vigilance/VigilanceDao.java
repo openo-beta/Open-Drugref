@@ -38,6 +38,18 @@ public class VigilanceDao implements TablesDao, Serializable {
      * characters. The phrase alternative comes first so that the quotes are kept together.
      */
     private static final Pattern SEARCH_TOKEN = Pattern.compile("[+-]?\"[^\"]*\"|\\S+");
+
+    /**
+     * Letters and digits make up words, and every other character separates them. The search
+     * term's words, and the word it is ranked on, must both be found by this one rule.
+     */
+    private static final Pattern NON_WORD = Pattern.compile("[^\\p{L}\\p{N}]+");
+
+    /**
+     * Text holding at least one letter or digit, for telling a real quoted phrase from an empty
+     * or punctuation-only one. Matched against the whole string.
+     */
+    private static final Pattern HAS_WORD_CHARACTER = Pattern.compile(".*[\\p{L}\\p{N}].*");
     private String name;
     private String version;
 
@@ -820,12 +832,12 @@ public class VigilanceDao implements TablesDao, Serializable {
      *         removed when it has no such word
      */
     private String firstSearchWord(String keyword) {
-        for (String word : keyword.trim().split("[^\\p{L}\\p{N}]+")) {
+        for (String word : NON_WORD.split(keyword.trim())) {
             if (word.length() >= MINIMUM_TOKEN_LENGTH) {
                 return word;
             }
         }
-        return keyword.trim().replaceAll("[^\\p{L}\\p{N}]", "");
+        return NON_WORD.matcher(keyword.trim()).replaceAll("");
     }
 
     /**
@@ -886,7 +898,7 @@ public class VigilanceDao implements TablesDao, Serializable {
                 continue;
             }
 
-            for (String word : token.split("[^\\p{L}\\p{N}]+")) {
+            for (String word : NON_WORD.split(token)) {
                 if (word.length() >= MINIMUM_TOKEN_LENGTH) {
                     parameterBuilder.append(sign).append(word).append("*").append(" ");
                 }
@@ -896,7 +908,7 @@ public class VigilanceDao implements TablesDao, Serializable {
         if (parameterBuilder.length() == 0) {
             // Every word was below the index's minimum length, as in "b-12". Retry with the
             // punctuation removed rather than searching for nothing, so "b-12" finds "B12".
-            String collapsed = keyword.toLowerCase().replaceAll("[^\\p{L}\\p{N}]", "");
+            String collapsed = NON_WORD.matcher(keyword.toLowerCase()).replaceAll("");
             if (!collapsed.isEmpty()) {
                 parameterBuilder.append("+").append(collapsed).append("*");
             }
@@ -916,7 +928,7 @@ public class VigilanceDao implements TablesDao, Serializable {
         return token.length() > 2
                 && token.startsWith("\"")
                 && token.endsWith("\"")
-                && token.substring(1, token.length() - 1).matches(".*[\\p{L}\\p{N}].*");
+                && HAS_WORD_CHARACTER.matcher(token.substring(1, token.length() - 1)).matches();
     }
 
 

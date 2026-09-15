@@ -361,6 +361,49 @@ public class VigilanceDao implements TablesDao, Serializable {
     }
 
     /**
+     * All search results are returned as a list of drug ingredients.
+     * Example: searching for a brand name will return only the ingredients
+     * for the brand name.
+     * @return
+     */
+    private Vector listSearchIngredient(String keyword) {
+
+        EntityManager em = JpaUtils.createEntityManager();
+        Assert.notNull(keyword, "Search value cannot be null.");
+
+        StringBuilder sql = new StringBuilder();
+        sql.append("SELECT ");
+        sql.append("uuid AS `id`,");
+        sql.append("CAST(?2 AS NCHAR) AS category,");
+        sql.append("GENcode AS `drugCode`,CONCAT(genericNameEnglish, ' ', IFNULL(strengthEnglish,''), ' ', IFNULL(formEnglish,'')) AS `name`,");
+        sql.append("genericNameEnglish,");
+        sql.append("strengthEnglish ");
+        sql.append("FROM vig_generxPlus ");
+        sql.append("WHERE GENcode IN (");
+        sql.append("SELECT GENcode ");
+        sql.append("FROM (");
+        sql.append("SELECT GENcode ");
+        sql.append("FROM vig_nomprodPlus ");
+        sql.append("WHERE MATCH(productNameEnglish, strengthEnglish, formEnglish) against (?1 IN BOOLEAN MODE)");
+        sql.append(" UNION ");
+        sql.append("SELECT GENcode ");
+        sql.append("FROM vig_generxPlus ");
+        sql.append("WHERE MATCH(lowercaseGenericNameEnglish, strengthEnglish, formEnglish) AGAINST (?1 IN BOOLEAN MODE)");
+        sql.append(") gencodes ");
+        sql.append("GROUP BY gencodes.GENcode having count(gencodes.GENcode) > -1 ");
+        sql.append(") ORDER BY genericNameEnglish, strengthEnglish;");
+
+        Query query = em.createNativeQuery(sql.toString(), Hashtable.class);
+        String parameters = parseParameters(keyword);
+        query.setParameter(1, parameters);
+        query.setParameter(2, Category.AI_GENERIC.getOrdinal());
+        List results = query.getResultList();
+        Vector<Hashtable<String, Object>> resultList = new Vector<Hashtable<String,Object>>(results);
+        JpaUtils.close(em);
+        return resultList;
+    }
+
+    /**
      * Any search will return all results brand, ingredient, generic, etc...
      * @return
      */
